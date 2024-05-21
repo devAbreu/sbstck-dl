@@ -5,14 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 
 	md "github.com/JohannesKaufmann/html-to-markdown"
 	"github.com/PuerkitoBio/goquery"
+	"github.com/alexferrari88/sbstck-dl/plugin"
 	"github.com/k3a/html2text"
 )
 
@@ -57,6 +61,9 @@ func (p *Post) ToMD(withTitle bool) (string, error) {
 		title = fmt.Sprintf("# %s\n\n", p.Title)
 	}
 	converter := md.NewConverter("", true, nil)
+
+	converter.Use(plugin.YoutubeEmbed())
+
 	body, err := converter.ConvertString(p.BodyHTML)
 	if err != nil {
 		return "", err
@@ -134,16 +141,19 @@ type PostWrapper struct {
 
 // Extractor is a utility for extracting Substack posts from URLs.
 type Extractor struct {
-	fetcher *Fetcher
+	fetcher         *Fetcher
+	downloadedPosts map[string]struct{}
+	logFile         string
 }
 
-// NewExtractor creates a new Extractor with the provided Fetcher.
 // If the Fetcher is nil, a default Fetcher will be used.
-func NewExtractor(f *Fetcher) *Extractor {
-	if f == nil {
-		f = NewFetcher()
+// NewExtractor creates a new Extractor with the provided Fetcher and log file.
+func NewExtractor(f *Fetcher, logFile string) (*Extractor, error) {
+	downloadedPosts, err := ReadLogFile(logFile)
+	if err != nil {
+		return nil, err
 	}
-	return &Extractor{fetcher: f}
+	return &Extractor{fetcher: f, downloadedPosts: downloadedPosts, logFile: logFile}, nil
 }
 
 // findScriptContent finds the content of the <script> tag containing JSON data.
@@ -170,8 +180,56 @@ func extractJSONString(scriptContent string) (string, error) {
 	return scriptContent[start+len("JSON.parse(\"") : end], nil
 }
 
-func (e *Extractor) ExtractPost(ctx context.Context, pageUrl string) (Post, error) {
-	// fetch page HTML content
+//	func (e *Extractor) ExtractPost(ctx context.Context, pageUrl string) (Post, error) {
+//		// fetch page HTML content
+//		body, err := e.fetcher.FetchURL(ctx, pageUrl)
+//		if err != nil {
+//			return Post{}, fmt.Errorf("failed to fetch page: %s", err)
+//		}
+//		defer body.Close()
+//
+//		doc, err := goquery.NewDocumentFromReader(body)
+//		if err != nil {
+//			return Post{}, fmt.Errorf("failed to fetch page: %s", err)
+//
+//		}
+//
+//		scriptContent := findScriptContent(doc)
+//
+//		if scriptContent == "" {
+//			return Post{}, fmt.Errorf("failed to fetch page: script content not found")
+//		}
+//
+//		jsonString, err := extractJSONString(scriptContent)
+//		if err != nil {
+//			return Post{}, fmt.Errorf("failed to fetch page: %s", err)
+//		}
+//
+//		// jsonString is a stringified JSON string. Convert it to a normal JSON string
+//		var rawJSON RawPost
+//		err = json.Unmarshal([]byte("\""+jsonString+"\""), &rawJSON.str) //json.NewEncoder(&rawJSON).Encode([]byte("\"" + jsonString + "\""))
+//		if err != nil {
+//			return Post{}, fmt.Errorf("failed to fetch page: %s", err)
+//		}
+//
+//		// Now convert the normal JSON string to a Go object
+//		p, err := rawJSON.ToPost()
+//		if err != nil {
+//			return Post{}, fmt.Errorf("failed to fetch page: %s", err)
+//		}
+//
+//		return p, nil
+//	}
+//
+// Modificar la función ExtractPost para incluir la extracción de archivos multimedia
+// ExtractPost extracts a post from a given URL and downloads associated media files if necessary.
+func (e *Extractor) ExtractPost(ctx context.Context, pageUrl string, outputFolder string, force bool) (Post, error) {
+	postID := extractPostID(pageUrl)
+	if _, exists := e.downloadedPosts[postID]; exists && !force {
+		fmt.Printf("Post %s already downloaded. Skipping...\n", postID)
+		return Post{}, nil
+	}
+
 	body, err := e.fetcher.FetchURL(ctx, pageUrl)
 	if err != nil {
 		return Post{}, fmt.Errorf("failed to fetch page: %s", err)
@@ -181,11 +239,9 @@ func (e *Extractor) ExtractPost(ctx context.Context, pageUrl string) (Post, erro
 	doc, err := goquery.NewDocumentFromReader(body)
 	if err != nil {
 		return Post{}, fmt.Errorf("failed to fetch page: %s", err)
-
 	}
 
 	scriptContent := findScriptContent(doc)
-
 	if scriptContent == "" {
 		return Post{}, fmt.Errorf("failed to fetch page: script content not found")
 	}
@@ -195,23 +251,38 @@ func (e *Extractor) ExtractPost(ctx context.Context, pageUrl string) (Post, erro
 		return Post{}, fmt.Errorf("failed to fetch page: %s", err)
 	}
 
-	// jsonString is a stringified JSON string. Convert it to a normal JSON string
 	var rawJSON RawPost
-	err = json.Unmarshal([]byte("\""+jsonString+"\""), &rawJSON.str) //json.NewEncoder(&rawJSON).Encode([]byte("\"" + jsonString + "\""))
+	err = json.Unmarshal([]byte("\""+jsonString+"\""), &rawJSON.str)
 	if err != nil {
 		return Post{}, fmt.Errorf("failed to fetch page: %s", err)
 	}
 
-	// Now convert the normal JSON string to a Go object
 	p, err := rawJSON.ToPost()
 	if err != nil {
 		return Post{}, fmt.Errorf("failed to fetch page: %s", err)
 	}
 
+	mediaUrls, err := p.ExtractMedia()
+	if err != nil {
+		return Post{}, fmt.Errorf("failed to extract media: %s", err)
+	}
+
+	postFolder := filepath.Join(outputFolder, p.Slug)
+	os.MkdirAll(postFolder, 0755)
+
+	downloadedFiles, err := DownloadMedia(mediaUrls, postFolder)
+	if err != nil {
+		return Post{}, fmt.Errorf("failed to download media: %s", err)
+	}
+
+	p.ReplaceMediaURLs(downloadedFiles)
+	e.downloadedPosts[postID] = struct{}{}
+	WriteLogFile(e.logFile, []string{postID})
+
 	return p, nil
 }
 
-type DateFilterFunc func(string) bool
+//type DateFilterFunc func(string) bool
 
 func (e *Extractor) GetAllPostsURLs(ctx context.Context, pubUrl string, f DateFilterFunc) ([]string, error) {
 	u, err := url.Parse(pubUrl)
@@ -269,22 +340,113 @@ type ExtractResult struct {
 	Err  error
 }
 
-func (e *Extractor) ExtractAllPosts(ctx context.Context, urls []string) <-chan ExtractResult {
+// ExtractAllPosts extracts all posts from a given list of URLs.
+func (e *Extractor) ExtractAllPosts(ctx context.Context, urls []string, outputFolder string, force bool) <-chan ExtractResult {
 	ch := make(chan ExtractResult, len(urls))
 
 	go func() {
 		var wg sync.WaitGroup
 		wg.Add(len(urls))
+		newDownloads := []string{}
 		for _, u := range urls {
 			go func(url string) {
 				defer wg.Done()
-				post, err := e.ExtractPost(ctx, url)
+				postID := extractPostID(url)
+				if _, exists := e.downloadedPosts[postID]; exists && !force {
+					fmt.Printf("Post %s already downloaded. Skipping...\n", postID)
+					return
+				}
+				post, err := e.ExtractPost(ctx, url, outputFolder, force)
+				if err == nil && postID != "" {
+					e.downloadedPosts[postID] = struct{}{}
+					newDownloads = append(newDownloads, postID)
+				}
 				ch <- ExtractResult{Post: post, Err: err}
 			}(u)
 		}
 		wg.Wait()
 		close(ch)
+		WriteLogFile(e.logFile, newDownloads)
 	}()
 
 	return ch
+}
+
+// Añadir nuevas funciones para descargar archivos multimedia y extraer URLs de videos
+func (p *Post) ExtractMedia() ([]string, error) {
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(p.BodyHTML))
+	if err != nil {
+		return nil, err
+	}
+
+	var mediaUrls []string
+	doc.Find("img").Each(func(i int, s *goquery.Selection) {
+		if src, exists := s.Attr("src"); exists {
+			mediaUrls = append(mediaUrls, src)
+		}
+	})
+
+	return mediaUrls, nil
+}
+
+// New function to download media files
+func DownloadMedia(urls []string, outputFolder string) (map[string]string, error) {
+	downloadedFiles := make(map[string]string)
+	for _, mediaUrl := range urls {
+		resp, err := http.Get(mediaUrl)
+		if err != nil {
+			return nil, fmt.Errorf("failed to download media: %w", err)
+		}
+		defer resp.Body.Close()
+
+		fileName := cleanFileName(mediaUrl)
+		outputPath := filepath.Join(outputFolder, fileName)
+		out, err := os.Create(outputPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create media file: %w", err)
+		}
+		defer out.Close()
+
+		_, err = io.Copy(out, resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to save media file: %w", err)
+		}
+		downloadedFiles[mediaUrl] = fileName
+	}
+	return downloadedFiles, nil
+}
+
+// cleanFileName extracts the filename from the URL and ensures it has a valid extension.
+func cleanFileName(mediaUrl string) string {
+	parsedUrl, err := url.PathUnescape(mediaUrl)
+	if err != nil {
+		parsedUrl = mediaUrl
+	}
+	segments := strings.Split(parsedUrl, "/")
+	fileName := segments[len(segments)-1]
+
+	// Ensure the file has a valid extension
+	validExtensions := []string{".jpeg", ".jpg", ".png", ".gif"}
+	for _, ext := range validExtensions {
+		if strings.HasSuffix(fileName, ext) {
+			return fileName
+		}
+	}
+
+	// Default to .jpg if no valid extension is found
+	return fileName + ".jpg"
+}
+
+func (p *Post) ReplaceMediaURLs(downloadedFiles map[string]string) {
+	for originalURL, fileName := range downloadedFiles {
+		p.BodyHTML = strings.ReplaceAll(p.BodyHTML, originalURL, fileName)
+	}
+}
+
+func extractPostID(url string) string {
+	match := regexp.MustCompile(`/p/([^/]+)`).FindStringSubmatch(url)
+	if len(match) > 1 {
+		return match[1]
+	}
+	return ""
 }
