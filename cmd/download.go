@@ -2,8 +2,11 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -14,11 +17,14 @@ import (
 )
 
 // downloadCmd represents the download command
+// downloadCmd represents the download command
 var (
 	downloadUrl  string
 	format       string
 	outputFolder string
 	dryRun       bool
+	force        bool
+	logFile      string
 	downloadCmd  = &cobra.Command{
 		Use:   "download",
 		Short: "Download individual posts or the entire public archive",
@@ -26,7 +32,11 @@ var (
 		Run: func(cmd *cobra.Command, args []string) {
 			startTime := time.Now()
 
-			// if url contains "/p/", we are downloading a single post
+			extractor, err := lib.NewExtractor(fetcher, logFile)
+			if err != nil {
+				log.Fatalf("Failed to create extractor: %v", err)
+			}
+
 			if strings.Contains(downloadUrl, "/p/") {
 				if verbose {
 					fmt.Printf("Downloading post %s\n", downloadUrl)
@@ -39,29 +49,37 @@ var (
 					fmt.Println("Warning: --before and --after flags are ignored when downloading a single post")
 				}
 
-				post, err := extractor.ExtractPost(ctx, downloadUrl)
+				post, err := extractor.ExtractPost(ctx, downloadUrl, outputFolder, force)
 				if err != nil {
 					log.Fatalln(err)
 				}
+				if post.Slug == "" {
+					fmt.Println("No post was downloaded. Skipping...")
+					return
+				}
+
 				downloadTime := time.Since(startTime)
 				if verbose {
 					fmt.Printf("Downloaded post %s in %s\n", downloadUrl, downloadTime)
 				}
 
-				path := makePath(post, outputFolder, format)
+				postFolder := filepath.Join(outputFolder, post.Slug)
+				path := filepath.Join(postFolder, fmt.Sprintf("%s.%s", post.Slug, format))
 				if verbose {
 					fmt.Printf("Writing post to file %s\n", path)
 				}
 
-				post.WriteToFile(path, format)
+				err = post.WriteToFile(path, format)
+				if err != nil {
+					log.Fatalln(err)
+				}
 
 				if verbose {
 					fmt.Println("Done in ", time.Since(startTime))
 				}
 			} else {
-				// we are downloading the entire archive
 				var downloadedPostsCount int
-				dateFilterfunc := makeDateFilterFunc(beforeDate, afterDate)
+				dateFilterfunc := lib.MakeDateFilterFunc(beforeDate, afterDate)
 				urls, err := extractor.GetAllPostsURLs(ctx, downloadUrl, dateFilterfunc)
 				urlsCount := len(urls)
 				if err != nil {
@@ -81,23 +99,11 @@ var (
 					fmt.Println("Dry run, exiting...")
 					return
 				}
-				urls, err = filterExistingPosts(urls, outputFolder, format)
-				if err != nil {
-					if verbose {
-						fmt.Println("Error filtering existing posts:", err)
-					}
-				}
-				if len(urls) == 0 {
-					if verbose {
-						fmt.Println("No new posts found, exiting...")
-					}
-					return
-				}
 				bar := progressbar.NewOptions(len(urls),
 					progressbar.OptionSetWidth(25),
 					progressbar.OptionSetDescription("downloading"),
 					progressbar.OptionShowBytes(true))
-				for result := range extractor.ExtractAllPosts(ctx, urls) {
+				for result := range extractor.ExtractAllPosts(ctx, urls, outputFolder, force) {
 					select {
 					case <-ctx.Done():
 						log.Fatalln("context cancelled")
@@ -110,6 +116,9 @@ var (
 						}
 						continue
 					}
+					if result.Post.Slug == "" {
+						continue
+					}
 					bar.Add(1)
 					downloadedPostsCount++
 					if verbose {
@@ -117,12 +126,16 @@ var (
 					}
 					post := result.Post
 
-					path := makePath(post, outputFolder, format)
+					postFolder := filepath.Join(outputFolder, post.Slug)
+					path := filepath.Join(postFolder, fmt.Sprintf("%s.%s", post.Slug, format))
 					if verbose {
 						fmt.Printf("Writing post to file %s\n", path)
 					}
 
-					post.WriteToFile(path, format)
+					err = post.WriteToFile(path, format)
+					if err != nil {
+						log.Fatalln(err)
+					}
 				}
 				if verbose {
 					fmt.Println("Downloaded", downloadedPostsCount, "posts, out of", len(urls))
@@ -138,6 +151,8 @@ func init() {
 	downloadCmd.Flags().StringVarP(&format, "format", "f", "html", "Specify the output format (options: \"html\", \"md\", \"txt\"")
 	downloadCmd.Flags().StringVarP(&outputFolder, "output", "o", ".", "Specify the download directory")
 	downloadCmd.Flags().BoolVarP(&dryRun, "dry-run", "d", false, "Enable dry run")
+	downloadCmd.Flags().BoolVarP(&force, "force", "", false, "Force re-download of posts")
+	downloadCmd.Flags().StringVar(&logFile, "log-file", "downloaded_posts.log", "Specify the log file to track downloaded posts")
 	downloadCmd.MarkFlagRequired("url")
 }
 
@@ -198,4 +213,29 @@ func filterExistingPosts(urls []string, outputFolder string, format string) ([]s
 		}
 	}
 	return filtered, nil
+}
+
+// Añadir lógica para descargar archivos multimedia
+func downloadMedia(urls []string, outputFolder string) error {
+	for _, mediaUrl := range urls {
+		resp, err := http.Get(mediaUrl)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+
+		fileName := filepath.Base(mediaUrl)
+		outputPath := filepath.Join(outputFolder, fileName)
+		out, err := os.Create(outputPath)
+		if err != nil {
+			return err
+		}
+		defer out.Close()
+
+		_, err = io.Copy(out, resp.Body)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
