@@ -87,7 +87,7 @@ var (
 			}
 
 			fetcher = lib.NewFetcher(lib.WithRatePerSecond(ratePerSecond), lib.WithProxyURL(parsedProxyURL), lib.WithCookie(cookie))
-			extractor = lib.NewExtractor(fetcher)
+			extractor, _ = lib.NewExtractor(fetcher, "downloaded_posts.log") // Default log file, can be overridden by flags
 		},
 	}
 )
